@@ -1,292 +1,213 @@
 # Request Validation: Don't Trust User Input
 
-Every piece of data that enters your backend from external sources—form submissions, API calls, URL parameters, file uploads—is a potential attack vector. The single most important security practice in backend development is simple: never trust user input. In this article, we'll explore how to implement robust request validation that protects your application from malicious data, injection attacks, and unexpected errors.
+Your API just accepted a negative age, an email that's 500 characters long, and a "role" field set to "admin" from a new user registration. Congratulations—you've just opened the door to data corruption, potential privilege escalation, and a database full of garbage. Request validation isn't optional. It's your first line of defense.
 
-## Table of Contents
+## What Happens Without Validation
 
-- [Why Validation Matters](#why-validation-matters)
-- [The OWASP Top 10 Connection](#the-owasp-top-10-connection)
-- [Types of Input to Validate](#types-of-input-to-validate)
-- [Validation Strategies](#validation-strategies)
-- [Common Validation Patterns](#common-validation-patterns)
-- [Validation Libraries](#validation-libraries)
-- [Error Handling and User Feedback](#error-handling-and-user-feedback)
-- [Security-Specific Validations](#security-specific-validations)
-- [Best Practices](#best-practices)
-- [Conclusion](#conclusion)
-
-## Why Validation Matters
-
-### The Cost of Missing Validation
-
-Without proper validation, your application is vulnerable to:
-
-1. **SQL Injection** - Malicious SQL code in input fields
-2. **Cross-Site Scripting (XSS)** - JavaScript code injection
-3. **Command Injection** - System command execution
-4. **Buffer Overflows** - Memory corruption attacks
-5. **Logic Errors** - Unexpected application behavior
-6. **Data Corruption** - Invalid data stored in databases
-
-### A Simple Example
+Every field in your API is an attack surface. Let's look at what goes wrong:
 
 ```javascript
-// ❌ Dangerous - no validation
-app.post('/api/users', (req, res) => {
-  const { email, age, role } = req.body;
-  
-  // What if email is not an email?
-  // What if age is -100 or "admin"?
-  // What if role is "administrator" instead of "user"?
-  
-  db.query('INSERT INTO users SET ?', { email, age, role });
+// ❌ No validation - trusting user input
+app.post('/api/users', async (req, res) => {
+  await db.query('INSERT INTO users SET ?', req.body);
   res.json({ success: true });
 });
 ```
 
-```javascript
-// ✅ Safe - with validation
-app.post('/api/users', (req, res) => {
-  const { error, value } = validateUser(req.body);
-  
-  if (error) {
-    return res.status(400).json({ error: error.details });
-  }
-  
-  db.query('INSERT INTO users SET ?', value);
-  res.json({ success: true });
-});
-```
+This code accepts **anything**:
+- `age: -500` → Negative ages in your database
+- `role: "admin"` → User just made themselves an admin
+- `email: "<script>alert('xss')</script>"` → Stored XSS attack
+- `id: { "$ne": "" }` → NoSQL injection (MongoDB)
 
-## The OWASP Top 10 Connection
+The fix isn't complex. You just need to validate before processing.
 
-Request validation directly addresses several OWASP Top 10 security risks:
+## Validation Fundamentals
 
-| OWASP Risk | How Validation Helps |
-|------------|---------------------|
-| A03: Injection | Prevents SQL, NoSQL, OS command injection |
-| A04: Insecure Design | Enforces business rules at input boundaries |
-| A05: Security Misconfiguration | Reduces attack surface |
-| A08: Software and Data Integrity | Validates data before processing |
+### Allowlist, Don't Blocklist
 
-## Types of Input to Validate
-
-### 1. Request Body
-
-The most common source of user input:
+Blocklists try to catch bad input. Allowlists only accept known-good input.
 
 ```javascript
-// JSON body
-{
-  "email": "user@example.com",
-  "password": "secretpass123",
-  "age": 25,
-  "preferences": { "newsletter": true }
-}
-```
-
-### 2. URL Parameters
-
-```javascript
-// Path parameters
-app.get('/api/users/:id', (req, res) => {
-  const id = req.params.id; // Must validate!
-});
-
-// Query parameters
-app.get('/api/products', (req, res) => {
-  const { page, limit, sort } = req.query; // Must validate!
-});
-```
-
-### 3. HTTP Headers
-
-```javascript
-app.post('/api/upload', (req, res) => {
-  const contentType = req.headers['content-type'];
-  const contentLength = parseInt(req.headers['content-length'], 10);
-  const authorization = req.headers['authorization'];
-  // All must be validated!
-});
-```
-
-### 4. File Uploads
-
-```javascript
-app.post('/api/avatar', upload.single('avatar'), (req, res) => {
-  const file = req.file;
-  // Validate: file type, size, dimensions, content
-});
-```
-
-### 5. Cookies
-
-```javascript
-app.use((req, res, next) => {
-  const sessionId = req.cookies.sessionId;
-  // Validate before using!
-});
-```
-
-## Validation Strategies
-
-### Allowlist vs Blocklist
-
-**Blocklist (Less Secure):** Block known bad patterns
-
-```javascript
-// ❌ Blocklist approach - fragile
-const blockedChars = ['<', '>', '"', "'", '&'];
-function sanitize(input) {
+// ❌ Blocklist - fragile, easy to bypass
+function sanitizeUsername(input) {
+  const badChars = ['<', '>', '"', "'", '&', ';', '|'];
   let result = input;
-  blockedChars.forEach(char => {
-    result = result.replace(char, '');
+  badChars.forEach(char => {
+    result = result.replaceAll(char, '');
   });
   return result;
 }
-// Problem: Attackers find ways around blocklists
-```
+// Problem: What about null bytes? Unicode tricks? New encodings?
 
-**Allowlist (More Secure):** Only accept known good patterns
-
-```javascript
-// ✅ Allowlist approach - robust
+// ✅ Allowlist - robust by default
 function validateUsername(input) {
-  // Only allow alphanumeric and underscores
   if (!/^[a-zA-Z0-9_]{3,20}$/.test(input)) {
-    throw new Error('Invalid username format');
+    throw new Error('Username must be 3-20 characters: letters, numbers, underscore only');
   }
   return input;
 }
 ```
 
-### Validation Layers
+Allowlists are safer because they **fail closed**—anything unexpected gets rejected.
 
-Apply validation at multiple layers:
+### Validate at the Boundary
+
+Check input at the edge of your application, before it reaches your business logic:
 
 ```
-Client → API Gateway → Application → Database
-   │         │              │             │
-   └─────────┴──────────────┴─────────────┘
-              Defense in Depth
+Request → [Validation Middleware] → [Business Logic] → [Database]
+                ↑ Check here
 ```
 
-1. **Client-side:** UX feedback (never trust alone!)
-2. **API Gateway:** Basic sanitization, rate limiting
-3. **Application:** Business logic validation
-4. **Database:** Data integrity constraints
-
-## Common Validation Patterns
-
-### String Validation
+This keeps your internal code clean and ensures consistent validation across all entry points.
 
 ```javascript
-// Length constraints
-const isValidName = (name) => 
-  typeof name === 'string' && 
-  name.length >= 2 && 
-  name.length <= 100;
+// ✅ Validation middleware
+const validateUser = (schema) => (req, res, next) => {
+  const { error, value } = schema.validate(req.body, { abortEarly: false });
+  if (error) {
+    return res.status(400).json({
+      error: 'Validation failed',
+      details: error.details.map(d => ({
+        field: d.path.join('.'),
+        message: d.message
+      }))
+    });
+  }
+  req.body = value; // Use sanitized value
+  next();
+};
 
-// Pattern matching
-const isValidEmail = (email) =>
-  /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
-
-// Alphanumeric only
-const isValidCode = (code) =>
-  /^[A-Z0-9]{6}$/.test(code);
+app.post('/api/users', validateUser(userSchema), createUser);
 ```
 
-### Number Validation
+## What to Validate
+
+### Request Body
+
+The most common source of user input:
 
 ```javascript
-// Range validation
-const isValidAge = (age) => {
-  const num = Number(age);
-  return Number.isInteger(num) && num >= 0 && num <= 150;
-};
+const Joi = require('joi');
 
-// Positive number
-const isValidPrice = (price) => {
-  const num = parseFloat(price);
-  return !isNaN(num) && num > 0;
-};
-
-// Enum values
-const isValidStatus = (status) =>
-  ['pending', 'active', 'completed', 'cancelled'].includes(status);
+const userSchema = Joi.object({
+  email: Joi.string().email().required().max(255),
+  password: Joi.string().min(8).max(100)
+    .pattern(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/)
+    .message('Password needs uppercase, lowercase, and number'),
+  age: Joi.number().integer().min(0).max(150).optional(),
+  role: Joi.string().valid('user', 'moderator').default('user')
+});
 ```
 
-### Date Validation
+### URL Parameters
+
+Never trust path or query params:
 
 ```javascript
-const isValidDate = (dateString) => {
-  const date = new Date(dateString);
-  return date instanceof Date && !isNaN(date);
-};
+// ❌ Direct use - SQL injection risk
+app.get('/api/users/:id', (req, res) => {
+  db.query(`SELECT * FROM users WHERE id = ${req.params.id}`);
+});
 
-const isFutureDate = (dateString) => {
-  const date = new Date(dateString);
-  return isValidDate(dateString) && date > new Date();
-};
+// ✅ Validated
+const idSchema = Joi.string().pattern(/^[a-f0-9]{24}$/);
 
-const isAgeValid = (birthDate) => {
-  const birth = new Date(birthDate);
-  const minAge = new Date();
-  minAge.setFullYear(minAge.getFullYear() - 13);
-  return birth <= minAge;
-};
+app.get('/api/users/:id', (req, res) => {
+  const { error, value } = idSchema.validate(req.params.id);
+  if (error) return res.status(400).json({ error: 'Invalid user ID' });
+  
+  // Use parameterized query with validated value
+  db.query('SELECT * FROM users WHERE id = ?', [value]);
+});
 ```
 
-### Array Validation
+### Query Parameters
+
+Pagination, filtering, sorting—all need validation:
 
 ```javascript
-const isValidTags = (tags) => {
-  return Array.isArray(tags) && 
-    tags.length <= 10 &&
-    tags.every(tag => 
-      typeof tag === 'string' && 
-      tag.length <= 30
-    );
-};
+const listSchema = Joi.object({
+  page: Joi.number().integer().min(1).default(1),
+  limit: Joi.number().integer().min(1).max(100).default(20),
+  sort: Joi.string().valid('createdAt', 'name', 'email').default('createdAt'),
+  order: Joi.string().valid('asc', 'desc').default('desc'),
+  search: Joi.string().max(100).optional()
+});
 
-const isValidProductIds = (ids) => {
-  return Array.isArray(ids) &&
-    ids.length > 0 &&
-    ids.every(id => /^[a-f0-9]{24}$/.test(id));
-};
+app.get('/api/users', (req, res) => {
+  const { error, value } = listSchema.validate(req.query);
+  if (error) return res.status(400).json({ error: error.details });
+  // Use validated value
+});
 ```
 
-### Object Validation
+### HTTP Headers
+
+Headers can be spoofed. Validate anything you use:
 
 ```javascript
-const isValidAddress = (address) => {
-  if (typeof address !== 'object' || address === null) {
-    return false;
+// ❌ Trusting header directly
+const userId = req.headers['x-user-id'];
+
+// ✅ Validated
+const userId = Joi.string().uuid().validate(req.headers['x-user-id']).value;
+```
+
+### File Uploads
+
+Files are a huge attack vector:
+
+```javascript
+const ALLOWED_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
+const MAX_SIZE = 5 * 1024 * 1024; // 5MB
+
+function validateFile(file) {
+  if (!file) throw new Error('No file provided');
+  if (!ALLOWED_TYPES.includes(file.mimetype)) {
+    throw new Error('Only JPEG, PNG, and WebP allowed');
+  }
+  if (file.size > MAX_SIZE) {
+    throw new Error('File too large (max 5MB)');
   }
   
-  const required = ['street', 'city', 'country', 'postalCode'];
-  const hasAll = required.every(field => 
-    typeof address[field] === 'string' && 
-    address[field].length > 0
-  );
+  // Verify actual content, not just extension
+  const magic = file.buffer.slice(0, 4);
+  const validSignatures = {
+    'ffd8ffe': 'jpeg',
+    '89504e47': 'png',
+    '52494646': 'webp'
+  };
   
-  return hasAll;
-};
+  const hex = magic.toString('hex');
+  if (!Object.keys(validSignatures).some(sig => hex.startsWith(sig))) {
+    throw new Error('File content doesn\'t match extension');
+  }
+  
+  return file;
+}
 ```
 
-## Validation Libraries
+## Using Validation Libraries
+
+Don't roll your own validation. Use battle-tested libraries.
 
 ### Joi (Node.js)
 
 ```javascript
 const Joi = require('joi');
 
-const userSchema = Joi.object({
+const createUserSchema = Joi.object({
   email: Joi.string()
     .email()
     .required()
-    .max(255),
-  
+    .max(255)
+    .messages({
+      'string.email': 'Please enter a valid email address',
+      'string.max': 'Email must be less than 255 characters'
+    }),
+    
   password: Joi.string()
     .min(8)
     .max(100)
@@ -295,39 +216,26 @@ const userSchema = Joi.object({
     .messages({
       'string.pattern.base': 'Password must contain uppercase, lowercase, and number'
     }),
-  
-  age: Joi.number()
-    .integer()
-    .min(0)
-    .max(150),
-  
+    
   role: Joi.string()
     .valid('user', 'moderator', 'admin')
     .default('user'),
-  
+    
   preferences: Joi.object({
     newsletter: Joi.boolean().default(false),
     notifications: Joi.boolean().default(true)
   }).default()
 });
 
-// Usage
-const { error, value } = userSchema.validate(req.body, {
-  abortEarly: false, // Return all errors
-  stripUnknown: true  // Remove unknown fields
+// Validate with options
+const { error, value } = createUserSchema.validate(req.body, {
+  abortEarly: false,  // Get all errors, not just first
+  stripUnknown: true, // Remove unknown fields
+  convert: true       // Type coercion (string "25" → number 25)
 });
-
-if (error) {
-  return res.status(400).json({ 
-    errors: error.details.map(d => ({
-      field: d.path.join('.'),
-      message: d.message
-    }))
-  });
-}
 ```
 
-### Zod (TypeScript/JavaScript)
+### Zod (TypeScript)
 
 ```typescript
 import { z } from 'zod';
@@ -336,49 +244,40 @@ const userSchema = z.object({
   email: z.string()
     .email()
     .max(255),
-  
+    
   password: z.string()
     .min(8)
     .max(100)
     .regex(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/, 
       'Password must contain uppercase, lowercase, and number'),
-  
+    
   age: z.number()
     .int()
     .min(0)
     .max(150)
     .optional(),
-  
+    
   role: z.enum(['user', 'moderator', 'admin'])
-    .default('user'),
-  
-  preferences: z.object({
-    newsletter: z.boolean().default(false),
-    notifications: z.boolean().default(true)
-  }).default({})
+    .default('user')
 });
 
-type User = z.infer<typeof userSchema>;
+type User = z.infer<typeof userSchema>; // Auto-generated type
 
-// Usage
+// Safe parse - doesn't throw
 const result = userSchema.safeParse(req.body);
-
 if (!result.success) {
-  return res.status(400).json({ 
-    errors: result.error.issues.map(issue => ({
-      field: issue.path.join('.'),
-      message: issue.message
-    }))
+  return res.status(400).json({
+    error: 'Validation failed',
+    issues: result.error.issues
   });
 }
-
 const validatedUser = result.data;
 ```
 
-### Pydantic (Python)
+### Pydantic (Python/FastAPI)
 
 ```python
-from pydantic import BaseModel, EmailStr, validator, Field
+from pydantic import BaseModel, EmailStr, Field, validator
 from typing import Optional
 import re
 
@@ -404,24 +303,157 @@ class UserCreate(BaseModel):
             raise ValueError('Invalid role')
         return v
 
-# Usage in FastAPI
-from fastapi import HTTPException
-
+# FastAPI auto-validates
 @app.post('/api/users')
 async def create_user(user: UserCreate):
-    # Validation happens automatically
-    return await create_user_in_db(user)
+    # user is already validated here
+    return await save_user(user)
 ```
 
-## Error Handling and User Feedback
+## Common Validation Patterns
 
-### Clear Error Messages
+### Strings
 
 ```javascript
-// ❌ Vague error
+// Length constraints
+name: Joi.string().min(2).max(100).trim().required()
+
+// Email
+email: Joi.string().email().required()
+
+// URL
+website: Joi.string().uri().optional()
+
+// Pattern matching
+slug: Joi.string().pattern(/^[a-z0-9-]+$/)
+
+// Enum
+status: Joi.string().valid('draft', 'published', 'archived')
+```
+
+### Numbers
+
+```javascript
+// Range
+age: Joi.number().integer().min(0).max(150)
+
+// Positive only
+price: Joi.number().positive().precision(2)
+
+// UUID count
+count: Joi.number().integer().min(1).max(100)
+```
+
+### Dates
+
+```javascript
+// ISO date
+birthDate: Joi.date().iso()
+
+// Range
+eventDate: Joi.date().min('now').max('2099-12-31')
+
+// Age validation
+birthDate: Joi.date().max('now').custom((value) => {
+  const age = Math.floor((Date.now() - value) / (365.25 * 24 * 60 * 60 * 1000));
+  if (age < 13) throw new Error('Must be at least 13 years old');
+  return value;
+})
+```
+
+### Arrays
+
+```javascript
+// List of strings
+tags: Joi.array().items(Joi.string().max(30)).max(10)
+
+// List of IDs
+userIds: Joi.array().items(Joi.string().pattern(/^[a-f0-9]{24}$/)).min(1)
+
+// Unique values
+categories: Joi.array().items(Joi.string()).unique()
+```
+
+### Nested Objects
+
+```javascript
+address: Joi.object({
+  street: Joi.string().required(),
+  city: Joi.string().required(),
+  country: Joi.string().required(),
+  postalCode: Joi.string().pattern(/^[A-Z0-9-]{3,10}$/).required()
+}).required()
+```
+
+## Security-Specific Validations
+
+### SQL Injection Prevention
+
+```javascript
+// ❌ NEVER concatenate user input into SQL
+const query = `SELECT * FROM users WHERE id = '${userId}'`;
+
+// ✅ Use parameterized queries
+const query = 'SELECT * FROM users WHERE id = ?';
+db.query(query, [validatedId]);
+
+// ✅ Or use an ORM
+const user = await User.findById(validatedId);
+```
+
+### NoSQL Injection Prevention
+
+```javascript
+// ❌ Vulnerable - attacker sends { "$ne": "" } as password
+db.users.findOne({ username, password });
+
+// ✅ Validate types explicitly
+if (typeof username !== 'string' || typeof password !== 'string') {
+  return res.status(400).json({ error: 'Invalid input' });
+}
+```
+
+### XSS Prevention
+
+```javascript
+import sanitizeHtml from 'sanitize-html';
+
+function validateHtml(content) {
+  return sanitizeHtml(content, {
+    allowedTags: ['p', 'b', 'i', 'em', 'strong', 'a', 'ul', 'ol', 'li'],
+    allowedAttributes: { 'a': ['href'] }
+  });
+}
+
+// In schema
+bio: Joi.string().custom(validateHtml)
+```
+
+### Path Traversal Prevention
+
+```javascript
+// ❌ User can request ../../../etc/passwd
+app.get('/api/files/:filename', (req, res) => {
+  res.sendFile(`/uploads/${req.params.filename}`);
+});
+
+// ✅ Validate and sanitize path
+const filename = req.params.filename.replace(/\.\./g, '');
+if (!/^[a-zA-Z0-9_.-]+$/.test(filename)) {
+  return res.status(400).json({ error: 'Invalid filename' });
+}
+res.sendFile(path.join('/uploads', filename));
+```
+
+## Error Handling
+
+### Clear, Actionable Messages
+
+```javascript
+// ❌ Vague
 return res.status(400).json({ error: 'Invalid input' });
 
-// ✅ Specific, actionable error
+// ✅ Specific and helpful
 return res.status(400).json({
   error: 'Validation failed',
   details: [
@@ -439,231 +471,37 @@ return res.status(400).json({
 });
 ```
 
-### Internationalization Support
+### Don't Leak Internal Structure
 
 ```javascript
-const errorMessages = {
-  en: {
-    'email.invalid': 'Please enter a valid email address',
-    'password.min': 'Password must be at least {min} characters',
-    'password.pattern': 'Password must contain uppercase, lowercase, and number'
-  },
-  de: {
-    'email.invalid': 'Bitte geben Sie eine gültige E-Mail-Adresse ein',
-    'password.min': 'Passwort muss mindestens {min} Zeichen haben',
-    'password.pattern': 'Passwort muss Großbuchstaben, Kleinbuchstaben und Zahl enthalten'
-  }
-};
-
-function getErrorMessage(code, language = 'en', params = {}) {
-  let message = errorMessages[language][code] || errorMessages['en'][code];
-  Object.entries(params).forEach(([key, value]) => {
-    message = message.replace(`{${key}}`, value);
-  });
-  return message;
-}
-```
-
-### Grouped Errors
-
-```javascript
-// Group errors by field for cleaner display
-function groupErrors(errors) {
-  return errors.reduce((acc, error) => {
-    const field = error.field;
-    if (!acc[field]) {
-      acc[field] = [];
-    }
-    acc[field].push(error.message);
-    return acc;
-  }, {});
-}
-
-// Result:
-{
-  "email": ["Please enter a valid email address"],
-  "password": [
-    "Password must be at least 8 characters",
-    "Password must contain uppercase letter"
-  ]
-}
-```
-
-## Security-Specific Validations
-
-### SQL Injection Prevention
-
-```javascript
-// ❌ NEVER do this
-const query = `SELECT * FROM users WHERE id = '${userId}'`;
-
-// ✅ Use parameterized queries
-const query = 'SELECT * FROM users WHERE id = ?';
-db.query(query, [userId]);
-
-// ✅ Or use an ORM with automatic escaping
-const user = await User.findById(userId);
-```
-
-### XSS Prevention
-
-```javascript
-// Sanitize HTML input
-const sanitizeHtml = require('sanitize-html');
-
-function validateHtmlContent(content) {
-  const clean = sanitizeHtml(content, {
-    allowedTags: ['p', 'b', 'i', 'em', 'strong', 'a'],
-    allowedAttributes: {
-      'a': ['href']
-    }
-  });
-  return clean;
-}
-```
-
-### File Upload Validation
-
-```javascript
-const ALLOWED_MIME_TYPES = ['image/jpeg', 'image/png', 'image/gif'];
-const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
-
-function validateFileUpload(file) {
-  // Check file exists
-  if (!file) {
-    throw new Error('No file provided');
-  }
-  
-  // Check MIME type
-  if (!ALLOWED_MIME_TYPES.includes(file.mimetype)) {
-    throw new Error('Invalid file type. Only JPEG, PNG, and GIF allowed.');
-  }
-  
-  // Check file size
-  if (file.size > MAX_FILE_SIZE) {
-    throw new Error('File too large. Maximum size is 5MB.');
-  }
-  
-  // Verify actual content (not just extension)
-  const buffer = fs.readFileSync(file.path);
-  const magicNumbers = buffer.slice(0, 4).toString('hex');
-  
-  const validSignatures = {
-    'ffd8ffe0': 'jpeg',
-    'ffd8ffe1': 'jpeg',
-    '89504e47': 'png',
-    '47494638': 'gif'
-  };
-  
-  const isValid = Object.keys(validSignatures).some(sig => 
-    magicNumbers.startsWith(sig)
-  );
-  
-  if (!isValid) {
-    throw new Error('File content does not match extension.');
-  }
-  
-  return true;
-}
-```
-
-### NoSQL Injection Prevention
-
-```javascript
-// ❌ Vulnerable to NoSQL injection
-app.post('/login', (req, res) => {
-  const { username, password } = req.body;
-  // Attacker sends: { "username": "admin", "password": { "$ne": "" } }
-  db.users.findOne({ username, password });
-});
-
-// ✅ Validate types explicitly
-app.post('/login', (req, res) => {
-  const { username, password } = req.body;
-  
-  if (typeof username !== 'string' || typeof password !== 'string') {
-    return res.status(400).json({ error: 'Invalid input' });
-  }
-  
-  db.users.findOne({ username, password });
-});
-```
-
-## Best Practices
-
-### 1. Validate Early, Validate Often
-
-```javascript
-// Validate at the entry point (middleware)
-const validateUser = (req, res, next) => {
-  const { error } = userSchema.validate(req.body);
-  if (error) {
-    return res.status(400).json({ error: error.details });
-  }
-  next();
-};
-
-app.post('/api/users', validateUser, createUser);
-app.put('/api/users/:id', validateUser, updateUser);
-```
-
-### 2. Use Type Coercion Carefully
-
-```javascript
-// Be explicit about type conversion
-const schema = Joi.object({
-  age: Joi.number().integer().min(0),
-  active: Joi.boolean(),
-  tags: Joi.array().items(Joi.string())
-});
-
-// String "25" becomes number 25
-// String "true" becomes boolean true
-// But invalid strings become errors
-```
-
-### 3. Sanitize After Validation
-
-```javascript
-// Validate first
-const { error, value } = schema.validate(input);
-if (error) return res.status(400).json({ error });
-
-// Then sanitize for storage
-const sanitized = {
-  ...value,
-  name: value.name.trim(),
-  email: value.email.toLowerCase(),
-  bio: sanitizeHtml(value.bio)
-};
-```
-
-### 4. Don't Reveal Internal Structure
-
-```javascript
-// ❌ Reveals internal structure
-return res.status(400).json({
+// ❌ Reveals database structure
+return res.status(404).json({
   error: `User with id ${userId} does not exist in table users`
 });
 
-// ✅ Generic error message
+// ✅ Generic message
 return res.status(404).json({
   error: 'Resource not found'
 });
 ```
 
-### 5. Log Validation Failures
+### Log Suspicious Activity
 
 ```javascript
 app.use((err, req, res, next) => {
   if (err.name === 'ValidationError') {
-    logger.warn('Validation failed', {
-      path: req.path,
-      method: req.method,
-      errors: err.details,
-      ip: req.ip,
-      userAgent: req.headers['user-agent']
-    });
+    // Check for potential attacks
+    const suspicious = err.details.some(d => 
+      /<script|javascript:|onerror|union select/i.test(d.value)
+    );
+    
+    if (suspicious) {
+      logger.warn('Suspicious input detected', {
+        ip: req.ip,
+        path: req.path,
+        errors: err.details
+      });
+    }
     
     return res.status(400).json({ error: 'Validation failed' });
   }
@@ -671,10 +509,52 @@ app.use((err, req, res, next) => {
 });
 ```
 
-### 6. Create Reusable Validation Schemas
+## Best Practices
+
+### 1. Validate Early, at the Edge
+
+Use middleware to validate before your handlers:
 
 ```javascript
-// Common schemas
+const validate = (schema) => (req, res, next) => {
+  const { error, value } = schema.validate(req.body, { abortEarly: false });
+  if (error) return res.status(400).json({ errors: error.details });
+  req.body = value;
+  next();
+};
+
+app.post('/api/users', validate(userSchema), createUser);
+```
+
+### 2. Be Strict by Default
+
+```javascript
+const schema = Joi.object({
+  email: Joi.string().email().required(),
+  password: Joi.string().min(8).required()
+}).options({ 
+  stripUnknown: true,  // Remove unknown fields
+  presence: 'required' // All fields required by default
+});
+```
+
+### 3. Sanitize After Validation
+
+```javascript
+const { error, value } = schema.validate(input);
+if (error) return res.status(400).json({ error });
+
+const sanitized = {
+  ...value,
+  email: value.email.toLowerCase().trim(),
+  name: value.name.trim(),
+  bio: sanitizeHtml(value.bio)
+};
+```
+
+### 4. Create Reusable Schemas
+
+```javascript
 const schemas = {
   id: Joi.string().pattern(/^[a-f0-9]{24}$/),
   email: Joi.string().email().max(255),
@@ -682,56 +562,23 @@ const schemas = {
     .pattern(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/),
   pagination: Joi.object({
     page: Joi.number().integer().min(1).default(1),
-    limit: Joi.number().integer().min(1).max(100).default(20),
-    sort: Joi.string().valid('createdAt', 'updatedAt', 'name').default('createdAt'),
-    order: Joi.string().valid('asc', 'desc').default('desc')
+    limit: Joi.number().integer().min(1).max(100).default(20)
   })
 };
 
 // Reuse across routes
-const getUserSchema = Joi.object({
-  id: schemas.id.required()
-});
-
-const listUsersSchema = Joi.object({
-  ...schemas.pagination,
-  search: Joi.string().max(100)
-});
+const getUserSchema = Joi.object({ id: schemas.id.required() });
+const listSchema = schemas.pagination.keys({ search: Joi.string().max(100) });
 ```
 
-### 7. Handle Edge Cases
+## Takeaways
 
-```javascript
-// Empty strings
-const schema = Joi.object({
-  name: Joi.string().trim().min(1).required(),
-  bio: Joi.string().allow('').max(500)
-});
+1. **Never trust user input**—every field is an attack surface
+2. **Use allowlists, not blocklists**—accept only known-good patterns
+3. **Validate at the boundary**—middleware before handlers
+4. **Use established libraries**—Joi, Zod, Pydantic—don't roll your own
+5. **Provide clear errors**—help users fix their input
+6. **Log suspicious patterns**—catch attacks early
+7. **Sanitize after validation**—clean data before storage
 
-// Null values
-const schema = Joi.object({
-  middleName: Joi.string().allow(null),
-  nickname: Joi.string().optional()
-});
-
-// Unexpected types
-const schema = Joi.object({
-  age: Joi.number().integer().min(0).strict() // Rejects string "25"
-});
-```
-
-## Conclusion
-
-Request validation is your first line of defense against security vulnerabilities and data corruption. By following these practices:
-
-- **Never trust user input** — validate everything from every source
-- **Use allowlists over blocklists** — accept only known good patterns
-- **Validate at multiple layers** — defense in depth
-- **Use established libraries** — Joi, Zod, Pydantic — don't roll your own
-- **Provide clear error messages** — help users fix their input
-- **Log validation failures** — detect attack patterns
-- **Sanitize after validation** — clean data before storage
-
-Remember: every field in your API is an attack surface. Treat it accordingly. Proper validation isn't just about preventing errors — it's about protecting your users, your data, and your application from malicious actors.
-
-The few minutes you spend implementing thorough validation will save you hours of debugging, security incident response, and data recovery down the line.
+Request validation isn't just about preventing errors. It's about protecting your users, your data, and your reputation. The few minutes you spend implementing thorough validation will save you hours of debugging security incidents and data corruption down the line.
