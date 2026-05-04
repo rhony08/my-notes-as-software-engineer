@@ -1,679 +1,305 @@
 # Health Checks and Readiness Probes
 
-When you deploy a backend service, how do you know it's actually working? A process might be running but stuck in an infinite loop, deadlocked, or unable to connect to its database. Health checks solve this problem by providing a standardized way for infrastructure and monitoring systems to verify your application is functioning correctly.
+Your service is running. Containers are up. But is it actually *ready* to handle requests?
 
-## Table of Contents
+At 3am, you get paged. The load balancer is sending traffic to your freshly deployed pods, but they're still warming up caches and connecting to databases. Users see 500 errors for 30 seconds after every deployment. Kubernetes *thinks* everything's fine—it just doesn't know the difference between "running" and "ready."
 
-- [What is a Health Check?](#what-is-a-health-check)
-- [Health Check Endpoints](#health-check-endpoints)
-- [Types of Health Checks](#types-of-health-checks)
-- [Readiness vs Liveness Probes](#readiness-vs-liveness-probes)
-- [Implementing Health Checks](#implementing-health-checks)
-- [Kubernetes Probes](#kubernetes-probes)
-- [Load Balancer Health Checks](#load-balancer-health-checks)
-- [Best Practices](#best-practices)
-- [Conclusion](#conclusion)
+Health checks are how you tell the truth. Let's sort out liveness vs readiness, and how to implement them without shooting yourself in the foot.
 
-## What is a Health Check?
+---
 
-A health check is an endpoint or mechanism that reports whether a service is operational. It's the "pulse check" of your application—answering the question: "Can this service handle requests?"
+## The Problem: Running ≠ Ready
 
-### Why Health Checks Matter
+Containers and orchestrators have a simple view of the world: process exists = healthy. But your app needs time to:
 
-**1. Zero-Downtime Deployments**
+- Establish database connections
+- Warm up caches
+- Load configuration
+- Connect to message queues
+- Complete initialization logic
 
-When rolling out a new version, load balancers and orchestration systems need to know when a service is ready to accept traffic:
+Without proper health checks, your orchestrator will route traffic to containers that aren't prepared, causing errors and failed requests.
 
-```
-Old version: Still healthy → Keep receiving traffic
-New version: Starting → Not ready → Don't send traffic
-New version: Healthy → Ready → Start receiving traffic
-Old version: Draining → Stop receiving traffic
-```
+---
 
-**2. Automatic Recovery**
+## Liveness vs Readiness: They're Different Things
 
-When a service becomes unhealthy, orchestration platforms can:
-- Restart the container
-- Route traffic to healthy instances
-- Alert operators
+| Probe Type | Purpose | Failure Behavior |
+|------------|---------|------------------|
+| **Liveness** | "Is this container dead?" | Restart the container |
+| **Readiness** | "Can this container handle traffic?" | Stop sending traffic, keep running |
 
-**3. Monitoring and Alerting**
+**Liveness** catches deadlocks, infinite loops, or stuck processes. If it fails, Kubernetes kills and restarts your pod.
 
-Health check failures trigger alerts before users notice problems:
-```
-Service: payment-api
-Health: UNHEALTHY
-Reason: Database connection pool exhausted
-Action: Alert on-call engineer
-```
-
-## Health Check Endpoints
-
-The most common implementation is an HTTP endpoint that returns a status.
-
-### Basic Health Check
-
-```javascript
-// Express.js
-app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'healthy' });
-});
-```
-
-```python
-# FastAPI
-@app.get("/health")
-async def health():
-    return {"status": "healthy"}
-```
-
-```go
-// Gin
-router.GET("/health", func(c *gin.Context) {
-    c.JSON(200, gin.H{"status": "healthy"})
-})
-```
-
-### Response Codes Convention
-
-| Status Code | Meaning |
-|-------------|---------|
-| 200 OK | Service is healthy |
-| 503 Service Unavailable | Service is unhealthy |
-
-Avoid using redirect codes or non-standard responses—orchestration tools expect simple 200/503 responses.
-
-## Types of Health Checks
-
-### 1. Shallow Health Check (Liveness)
-
-Checks if the process is running and can respond to HTTP requests.
-
-```javascript
-app.get('/health/live', (req, res) => {
-  // Just checking if the process is alive
-  res.status(200).json({ status: 'alive' });
-});
-```
-
-**Pros:** Fast, no dependencies
-**Cons:** Doesn't verify the service can actually do work
-
-**Use for:** Detecting deadlocks, hung processes, or crashes
-
-### 2. Deep Health Check (Readiness)
-
-Verifies all dependencies are available and the service can process requests.
-
-```javascript
-app.get('/health/ready', async (req, res) => {
-  const checks = {
-    database: await checkDatabase(),
-    redis: await checkRedis(),
-    externalApi: await checkExternalApi()
-  };
-  
-  const allHealthy = Object.values(checks).every(c => c.status === 'ok');
-  
-  res.status(allHealthy ? 200 : 503).json({
-    status: allHealthy ? 'healthy' : 'unhealthy',
-    checks
-  });
-});
-
-async function checkDatabase() {
-  try {
-    await db.query('SELECT 1');
-    return { status: 'ok' };
-  } catch (error) {
-    return { status: 'error', message: error.message };
-  }
-}
-
-async function checkRedis() {
-  try {
-    await redis.ping();
-    return { status: 'ok' };
-  } catch (error) {
-    return { status: 'error', message: error.message };
-  }
-}
-```
-
-**Pros:** Validates actual functionality
-**Cons:** Slower, can cause cascading failures if not careful
-
-### 3. Startup Probe
-
-Checks if the application has finished starting up. Used to delay other probes during initialization.
-
-```javascript
-let isReady = false;
-
-// During startup
-async function initialize() {
-  await connectDatabase();
-  await warmCache();
-  await loadConfig();
-  isReady = true;
-}
-
-app.get('/health/startup', (req, res) => {
-  if (isReady) {
-    res.status(200).json({ status: 'started' });
-  } else {
-    res.status(503).json({ status: 'starting' });
-  }
-});
-```
-
-## Readiness vs Liveness Probes
-
-Understanding the difference is critical for production reliability.
-
-### Liveness Probe: "Should this container be restarted?"
-
-**Purpose:** Detect unrecoverable states
-- Deadlocks
-- Memory corruption
-- Infinite loops
-
-**Action on failure:** Restart the container
+**Readiness** catches initialization, dependency issues, or overload. If it fails, Kubernetes stops routing traffic but lets the container run.
 
 ```yaml
-# Kubernetes liveness probe
+# Kubernetes probe configuration
 livenessProbe:
   httpGet:
     path: /health/live
-    port: 3000
-  initialDelaySeconds: 10
+    port: 8080
+  initialDelaySeconds: 30   # Wait before first check
+  periodSeconds: 10         # Check every 10 seconds
+  timeoutSeconds: 5         # Fail if no response in 5 seconds
+  failureThreshold: 3       # Restart after 3 failures
+
+readinessProbe:
+  httpGet:
+    path: /health/ready
+    port: 8080
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  failureThreshold: 3       # Stop traffic after 3 failures
+```
+
+---
+
+## What to Check
+
+### Liveness: Keep It Simple
+
+Your liveness endpoint should answer one question: "Can this process respond to HTTP requests?"
+
+```python
+# ✅ Good liveness check - minimal dependencies
+@app.get("/health/live")
+async def liveness():
+    return {"status": "alive"}
+```
+
+```python
+# ❌ Bad liveness check - too many dependencies
+@app.get("/health/live")
+async def liveness():
+    # If database is slow, this will timeout and restart the pod
+    # But the database being slow doesn't mean the pod is dead!
+    await db.execute("SELECT 1")
+    await redis.ping()
+    await external_api.check()
+    return {"status": "alive"}
+```
+
+**Why:** If your liveness check depends on external services, you might restart healthy pods when those services are slow. That makes problems worse.
+
+### Readiness: Check Everything You Need
+
+Your readiness endpoint should verify all dependencies needed to serve requests:
+
+```python
+# ✅ Good readiness check - verify dependencies
+@app.get("/health/ready")
+async def readiness():
+    checks = {
+        "database": await check_database(),
+        "redis": await check_redis(),
+        "cache": cache.is_warmed()
+    }
+    
+    all_healthy = all(checks.values())
+    
+    if not all_healthy:
+        # Return 503 so orchestrator knows to back off
+        raise HTTPException(503, detail=checks)
+    
+    return {"status": "ready", "checks": checks}
+```
+
+---
+
+## Startup Probes: For Slow Starters
+
+Some apps need a long time to initialize. Maybe you're loading ML models, warming large caches, or running migrations. Liveness probes will kill your pod before it finishes starting.
+
+**Startup probes** solve this: they disable liveness checks until the app is fully started.
+
+```yaml
+startupProbe:
+  httpGet:
+    path: /health/startup
+    port: 8080
+  initialDelaySeconds: 0
+  periodSeconds: 10
+  failureThreshold: 30      # Allow up to 5 minutes (30 * 10s)
+  
+livenessProbe:
+  httpGet:
+    path: /health/live
+    port: 8080
+  initialDelaySeconds: 0    # Will wait for startup probe first
   periodSeconds: 10
   failureThreshold: 3
 ```
 
-If this fails 3 times, Kubernetes restarts the container.
+---
 
-### Readiness Probe: "Should this container receive traffic?"
+## Common Mistakes
 
-**Purpose:** Detect temporary unavailability
-- Database connection lost
-- Cache warming in progress
-- Dependent service down
-
-**Action on failure:** Stop sending traffic (don't restart)
-
-```yaml
-# Kubernetes readiness probe
-readinessProbe:
-  httpGet:
-    path: /health/ready
-    port: 3000
-  initialDelaySeconds: 5
-  periodSeconds: 5
-  failureThreshold: 3
-```
-
-If this fails, Kubernetes removes the pod from service endpoints but doesn't restart it.
-
-### Key Difference
-
-| Scenario | Liveness | Readiness |
-|----------|----------|-----------|
-| Database connection lost | No restart needed | Stop traffic |
-| Memory leak / deadlock | Restart | N/A |
-| Slow startup | N/A | Don't send traffic yet |
-| External API slow | No restart | Maybe stop traffic |
-
-## Implementing Health Checks
-
-### Express.js Implementation
-
-```javascript
-const express = require('express');
-const app = express();
-
-// Track application state
-let isShuttingDown = false;
-let dbConnected = false;
-let redisConnected = false;
-
-// Graceful shutdown flag
-process.on('SIGTERM', () => {
-  console.log('Received SIGTERM, starting graceful shutdown');
-  isShuttingDown = true;
-});
-
-// Liveness - just check if process is responsive
-app.get('/health/live', (req, res) => {
-  if (isShuttingDown) {
-    // During shutdown, return 503 so traffic stops
-    return res.status(503).json({ status: 'shutting down' });
-  }
-  res.status(200).json({ status: 'alive' });
-});
-
-// Readiness - check if we can handle requests
-app.get('/health/ready', async (req, res) => {
-  if (isShuttingDown) {
-    return res.status(503).json({ status: 'shutting down' });
-  }
-  
-  const checks = {
-    database: dbConnected ? 'ok' : 'error',
-    redis: redisConnected ? 'ok' : 'error'
-  };
-  
-  const healthy = dbConnected && redisConnected;
-  
-  res.status(healthy ? 200 : 503).json({
-    status: healthy ? 'healthy' : 'unhealthy',
-    checks
-  });
-});
-
-// Combined endpoint for simple setups
-app.get('/health', (req, res) => {
-  res.redirect('/health/ready');
-});
-```
-
-### FastAPI Implementation
+### ❌ Health Checks That Lie
 
 ```python
-from fastapi import FastAPI, Response
-from pydantic import BaseModel
-import asyncio
+# Always returns 200 even when broken
+@app.get("/health")
+async def health():
+    return {"status": "ok"}  # Does this actually check anything?
+```
 
-app = FastAPI()
+This is worse than no health check. You're telling the orchestrator everything's fine when it's not.
 
-class HealthStatus(BaseModel):
-    status: str
-    checks: dict = None
+### ❌ Checking External Dependencies in Liveness
 
-# Application state
-app_state = {
-    "is_shutting_down": False,
-    "db_connected": False,
-    "redis_connected": False
-}
-
+```python
+# If external API is down, your pods get restarted
 @app.get("/health/live")
 async def liveness():
-    if app_state["is_shutting_down"]:
-        return Response(content='{"status":"shutting down"}', 
-                       status_code=503,
-                       media_type="application/json")
+    await external_payment_api.ping()  # DO NOT DO THIS
     return {"status": "alive"}
+```
+
+Result: Payment API has issues → your pods restart → more traffic to already-stressed API → cascade failure.
+
+### ❌ Too Aggressive Timeouts
+
+```yaml
+livenessProbe:
+  timeoutSeconds: 1    # Too short for realistic workloads
+```
+
+If your app is under load and responses take 1.5 seconds, your pods will restart repeatedly. Set realistic timeouts.
+
+### ❌ No Graceful Shutdown
+
+```python
+# When readiness fails, stop accepting new requests
+# but finish in-flight requests before dying
+@app.on_event("shutdown")
+async def shutdown():
+    logger.info("Shutting down, draining connections...")
+    await drain_connections(timeout=30)
+```
+
+---
+
+## Implementation Patterns
+
+### Structured Health Responses
+
+```python
+from dataclasses import dataclass
+from datetime import datetime
+
+@dataclass
+class HealthStatus:
+    status: str
+    timestamp: str
+    version: str
+    checks: dict
 
 @app.get("/health/ready")
 async def readiness():
-    if app_state["is_shutting_down"]:
-        return Response(content='{"status":"shutting down"}',
-                       status_code=503,
-                       media_type="application/json")
-    
     checks = {
-        "database": "ok" if app_state["db_connected"] else "error",
-        "redis": "ok" if app_state["redis_connected"] else "error"
+        "database": await db.health_check(),
+        "redis": await redis.ping(),
+        "external_api": await external_api.health_check()
     }
     
-    healthy = all(v == "ok" for v in checks.values())
-    
-    if not healthy:
-        return Response(
-            content=f'{{"status":"unhealthy","checks":{checks}}}',
-            status_code=503,
-            media_type="application/json"
-        )
-    
-    return {"status": "healthy", "checks": checks}
+    return HealthStatus(
+        status="healthy" if all(checks.values()) else "degraded",
+        timestamp=datetime.utcnow().isoformat(),
+        version=os.getenv("APP_VERSION", "unknown"),
+        checks=checks
+    )
 ```
 
-### Go Implementation
+### Startup Logic
 
-```go
-package main
+```python
+class StartupState:
+    is_ready = False
+    
+    async def mark_ready(self):
+        self.is_ready = True
 
-import (
-    "net/http"
-    "sync"
-    
-    "github.com/gin-gonic/gin"
-)
+startup_state = StartupState()
 
-type HealthChecker struct {
-    mu             sync.RWMutex
-    shuttingDown   bool
-    dbHealthy      bool
-    redisHealthy   bool
-}
+@app.on_event("startup")
+async def startup():
+    await connect_database()
+    await warm_cache()
+    startup_state.is_ready = True
 
-func (h *HealthChecker) Liveness(c *gin.Context) {
-    h.mu.RLock()
-    defer h.mu.RUnlock()
-    
-    if h.shuttingDown {
-        c.JSON(503, gin.H{"status": "shutting down"})
-        return
-    }
-    c.JSON(200, gin.H{"status": "alive"})
-}
-
-func (h *HealthChecker) Readiness(c *gin.Context) {
-    h.mu.RLock()
-    defer h.mu.RUnlock()
-    
-    if h.shuttingDown {
-        c.JSON(503, gin.H{"status": "shutting down"})
-        return
-    }
-    
-    checks := map[string]string{
-        "database": "ok",
-        "redis":   "ok",
-    }
-    
-    if !h.dbHealthy {
-        checks["database"] = "error"
-    }
-    if !h.redisHealthy {
-        checks["redis"] = "error"
-    }
-    
-    healthy := h.dbHealthy && h.redisHealthy
-    
-    status := 200
-    if !healthy {
-        status = 503
-    }
-    
-    c.JSON(status, gin.H{
-        "status": map[bool]string{true: "healthy", false: "unhealthy"}[healthy],
-        "checks": checks,
-    })
-}
+@app.get("/health/ready")
+async def readiness():
+    if not startup_state.is_ready:
+        raise HTTPException(503, detail="Still initializing")
+    return {"status": "ready"}
 ```
 
-## Kubernetes Probes
-
-Kubernetes has built-in support for health checks through probes.
-
-### Complete Pod Configuration
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: my-api
-spec:
-  replicas: 3
-  selector:
-    matchLabels:
-      app: my-api
-  template:
-    metadata:
-      labels:
-        app: my-api
-    spec:
-      containers:
-      - name: api
-        image: my-api:v1.0.0
-        ports:
-        - containerPort: 3000
-        
-        # Startup probe - give the app time to start
-        startupProbe:
-          httpGet:
-            path: /health/startup
-            port: 3000
-          initialDelaySeconds: 0
-          periodSeconds: 5
-          failureThreshold: 30  # 30 * 5 = 150s max startup time
-        
-        # Liveness probe - restart if unhealthy
-        livenessProbe:
-          httpGet:
-            path: /health/live
-            port: 3000
-          periodSeconds: 10
-          failureThreshold: 3
-          timeoutSeconds: 5
-        
-        # Readiness probe - don't send traffic if unhealthy
-        readinessProbe:
-          httpGet:
-            path: /health/ready
-            port: 3000
-          periodSeconds: 5
-          failureThreshold: 3
-          timeoutSeconds: 5
-        
-        # Graceful shutdown
-        lifecycle:
-          preStop:
-            exec:
-              command: ["/bin/sh", "-c", "sleep 10"]
-```
-
-### Probe Types
-
-| Probe | Purpose | Action on Failure |
-|-------|---------|-------------------|
-| `startupProbe` | App initialization | Don't start other probes yet |
-| `livenessProbe` | Deadlock/crash detection | Restart container |
-| `readinessProbe` | Traffic routing | Remove from service |
-
-### Probe Parameters
-
-```yaml
-readinessProbe:
-  httpGet:
-    path: /health/ready
-    port: 3000
-    httpHeaders:              # Optional headers
-    - name: X-Health-Check
-      value: "true"
-  
-  initialDelaySeconds: 5     # Wait before first check
-  periodSeconds: 10          # Check every 10 seconds
-  timeoutSeconds: 5          # Timeout for response
-  failureThreshold: 3        # Failures before unhealthy
-  successThreshold: 1        # Successes before healthy
-```
-
-### Alternative Probe Types
-
-**TCP Probe:**
-```yaml
-livenessProbe:
-  tcpSocket:
-    port: 3306
-  periodSeconds: 10
-```
-
-**Command Probe:**
-```yaml
-livenessProbe:
-  exec:
-    command:
-    - /bin/sh
-    - -c
-    - "pg_isready -h localhost"
-  periodSeconds: 10
-```
+---
 
 ## Load Balancer Health Checks
 
-Load balancers (AWS ALB, Nginx, HAProxy) also use health checks.
+If you're behind a load balancer (ALB, nginx, Cloudflare), it also needs to know when your app is unhealthy:
 
-### AWS Application Load Balancer
+```
+# nginx upstream health check
+upstream backend {
+    server app1:8080 max_fails=3 fail_timeout=30s;
+    server app2:8080 max_fails=3 fail_timeout=30s;
+}
+```
 
-```yaml
-# Target Group Configuration
-HealthCheckPath: /health
+```
+# AWS ALB target group health check
+HealthCheckPath: /health/ready
 HealthCheckIntervalSeconds: 30
 HealthCheckTimeoutSeconds: 5
 HealthyThresholdCount: 2
 UnhealthyThresholdCount: 3
-Matcher:
-  HttpCode: 200
 ```
 
-### Nginx Upstream Health Check
+Match your orchestrator and load balancer settings to avoid conflicting behaviors.
 
-```nginx
-upstream backend {
-  server 10.0.0.1:3000 max_fails=3 fail_timeout=30s;
-  server 10.0.0.2:3000 max_fails=3 fail_timeout=30s;
-  
-  # Active health check (requires nginx-plus or openresty)
-  check interval=5000 rise=2 fall=3 timeout=1000 type=http;
-  check_http_send "GET /health HTTP/1.0\r\n\r\n";
-  check_http_expect_alive http_2xx http_3xx;
-}
+---
+
+## Monitoring Your Health Checks
+
+Health check failures should be observable:
+
+- **Metrics:** Track `/health/*` response times and status codes
+- **Logs:** Log when readiness fails and why
+- **Alerts:** Alert on repeated liveness failures (pods restarting)
+
+```python
+@app.get("/health/ready")
+async def readiness():
+    checks = await run_health_checks()
+    
+    if not all(checks.values()):
+        logger.warning("Readiness check failed", extra={"checks": checks})
+        metrics.increment("health.ready.failed")
+        raise HTTPException(503, detail=checks)
+    
+    return {"status": "ready"}
 ```
 
-### HAProxy Health Check
+---
 
-```
-backend myapi
-  balance roundrobin
-  option httpchk GET /health
-  http-check expect status 200
-  server app1 10.0.0.1:3000 check
-  server app2 10.0.0.2:3000 check
-```
+## Quick Reference
 
-## Best Practices
+| Check Type | Endpoint | Dependencies | Failure = |
+|------------|----------|--------------|-----------|
+| Liveness | `/health/live` | None | Restart pod |
+| Readiness | `/health/ready` | All required | Stop traffic |
+| Startup | `/health/startup` | None (just initialization) | Keep waiting |
 
-### 1. Keep Liveness Checks Simple
+---
 
-```javascript
-// ✅ Good - fast and simple
-app.get('/health/live', (req, res) => {
-  res.status(200).json({ status: 'alive' });
-});
+## Takeaways
 
-// ❌ Bad - includes dependency checks
-app.get('/health/live', async (req, res) => {
-  await db.query('SELECT 1');  // Don't do this
-  await redis.ping();          // Don't do this
-  res.status(200).json({ status: 'alive' });
-});
-```
-
-**Why:** If your database is slow, liveness probe fails, container restarts, but database is still slow—causing a restart loop.
-
-### 2. Use Meaningful Response Details
-
-```javascript
-app.get('/health/ready', async (req, res) => {
-  const checks = {
-    database: { status: 'ok', latencyMs: 5 },
-    redis: { status: 'ok', latencyMs: 2 },
-    externalApi: { status: 'degraded', latencyMs: 2500 }
-  };
-  
-  res.status(200).json({
-    status: 'healthy',
-    version: process.env.APP_VERSION,
-    uptime: process.uptime(),
-    checks
-  });
-});
-```
-
-### 3. Implement Graceful Shutdown
-
-```javascript
-const server = app.listen(3000);
-
-process.on('SIGTERM', async () => {
-  console.log('Shutting down gracefully...');
-  
-  // Stop accepting new connections
-  server.close(() => {
-    console.log('HTTP server closed');
-  });
-  
-  // Close database connections
-  await db.close();
-  await redis.quit();
-  
-  process.exit(0);
-});
-```
-
-### 4. Set Appropriate Timeouts
-
-```yaml
-# Kubernetes
-livenessProbe:
-  timeoutSeconds: 5      # Should be fast
-  failureThreshold: 3    # 3 failures = restart
-
-readinessProbe:
-  timeoutSeconds: 10     # Can be longer for deep checks
-  failureThreshold: 3    # 3 failures = stop traffic
-```
-
-### 5. Don't Check External Dependencies in Liveness
-
-```
-Liveness Probe: Is my process alive?
-Readiness Probe: Can I handle requests?
-
-External APIs: May be temporarily slow/down
-- Don't restart your container because someone else is slow
-- Use readiness to route away traffic instead
-```
-
-### 6. Include Health Check in All Services
-
-Every service should have health checks, even "internal" ones:
-
-```yaml
-# Even internal services need health checks
-services:
-  internal-metrics:
-    healthCheck: /health
-    # If this fails, dependent services can react
-```
-
-### 7. Use a Dedicated Health Check Port (Optional)
-
-Separate health checks from application traffic:
-
-```javascript
-// Main app on port 3000
-const app = express();
-app.listen(3000);
-
-// Health on port 3001 (internal only)
-const healthApp = express();
-healthApp.get('/health', (req, res) => res.json({ status: 'ok' }));
-healthApp.listen(3001);
-```
-
-**Benefits:**
-- Health checks not affected by app load
-- Can bind to different network interface
-- Simpler monitoring
-
-## Conclusion
-
-Health checks are fundamental to reliable distributed systems:
-
-- **Liveness probes** detect when a container needs to be restarted
-- **Readiness probes** determine if a container should receive traffic
-- **Startup probes** handle slow-starting applications
-
-By implementing proper health checks, you enable:
-
-- Zero-downtime deployments
-- Automatic recovery from failures
-- Better monitoring and alerting
-- Smoother scaling operations
-
-Remember: A simple `/health` endpoint returning `200 OK` is infinitely better than no health check at all. Start simple, then add depth as your needs evolve.
+1. **Liveness checks if your process is dead** — don't check external dependencies
+2. **Readiness checks if you can serve traffic** — verify all dependencies
+3. **Startup probes buy you time** for slow initialization
+4. **Return proper status codes** — 200 for healthy, 503 for not ready
+5. **Log and monitor failures** — health checks are your early warning system
+6. **Test your health checks** — they're critical infrastructure, treat them that way
